@@ -1,0 +1,10 @@
+#ifndef IPCP_L1_IT512_CS1024_RST64_RR256_H
+#define IPCP_L1_IT512_CS1024_RST64_RR256_H
+
+#define IPCP_L1_NUM_IP_TABLE_L1_ENTRIES 512
+// #define IPCP_L1_NUM_CSPT_ENTRIES 1024
+// #define IPCP_L1_NUM_RST_ENTRIES 64
+// #define IPCP_L1_NUM_OF_RR_ENTRIES 256
+#include "../ipcp_l1/ipcp_l1.h"
+
+#endif

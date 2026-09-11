@@ -1,0 +1,5 @@
+#define IPCP_L1_NUM_IP_TABLE_L1_ENTRIES 256
+// #define IPCP_L1_NUM_CSPT_ENTRIES 512
+// #define IPCP_L1_NUM_RST_ENTRIES 32
+// #define IPCP_L1_NUM_OF_RR_ENTRIES 128
+#include "../ipcp_l1/ipcp_l1.cc"

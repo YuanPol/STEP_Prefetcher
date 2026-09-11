@@ -1,0 +1,870 @@
+/*
+ *    Copyright 2023 The ChampSim Contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "cache.h"
+
+#include <algorithm>
+#include <iomanip>
+
+#include "champsim.h"
+#include "champsim_constants.h"
+#include "instruction.h"
+#include "util.h"
+#include <fstream>
+#include <iostream>
+#include <cassert>
+
+
+bool CACHE::handle_fill(const PACKET& fill_mshr) {
+    cpu = fill_mshr.cpu;
+
+    // find victim
+    auto [set_begin, set_end] = get_set_span(fill_mshr.address);
+    auto [way_begin_idx, way_end_idx] = way_partition_bounds(fill_mshr.type);
+    auto allowed_begin = std::next(set_begin, static_cast<set_type::difference_type>(way_begin_idx));
+    auto allowed_end = std::next(set_begin, static_cast<set_type::difference_type>(way_end_idx));
+
+    auto way = std::find_if_not(allowed_begin, allowed_end, [](auto x) { return x.valid; });
+    if (way == allowed_end) {
+        auto victim_idx =
+            impl_find_victim(fill_mshr.cpu, fill_mshr.instr_id, get_set_index(fill_mshr.address), &*set_begin, fill_mshr.ip, fill_mshr.address, fill_mshr.type);
+        assert(way_begin_idx <= victim_idx);
+        assert(victim_idx < way_end_idx);
+        way = std::next(set_begin, static_cast<set_type::difference_type>(victim_idx));
+    }
+    assert(set_begin <= way);
+    assert(way <= set_end);
+    const auto way_idx = static_cast<std::size_t>(std::distance(set_begin, way)); // cast protected by earlier assertion
+
+    if constexpr (champsim::debug_print) {
+        std::cout << "[" << NAME << "] " << __func__;
+        std::cout << " instr_id: " << fill_mshr.instr_id << " address: " << std::hex << (fill_mshr.address >> OFFSET_BITS);
+        std::cout << " full_addr: " << fill_mshr.address;
+        std::cout << " full_v_addr: " << fill_mshr.v_address << std::dec;
+        std::cout << " set: " << get_set_index(fill_mshr.address);
+        std::cout << " way: " << way_idx;
+        std::cout << " type: " << +fill_mshr.type;
+        std::cout << " cycle_enqueued: " << fill_mshr.cycle_enqueued;
+        std::cout << " cycle: " << current_cycle << std::endl;
+    }
+
+    bool success = true;
+    auto metadata_thru = fill_mshr.pf_metadata;
+    auto pkt_address = (virtual_prefetch ? fill_mshr.v_address : fill_mshr.address) & ~champsim::bitmask(match_offset_bits ? 0 : OFFSET_BITS);
+    if (way != set_end) {
+        if (way->valid && way->dirty) {
+            PACKET writeback_packet;
+
+            writeback_packet.cpu = fill_mshr.cpu;
+            writeback_packet.address = way->address;
+            writeback_packet.data = way->data;
+            writeback_packet.instr_id = fill_mshr.instr_id;
+            writeback_packet.ip = 0;
+            writeback_packet.type = WRITE;
+            writeback_packet.pf_metadata = way->pf_metadata;
+
+            success = lower_level->add_wq(writeback_packet);
+        }
+
+        if (success) {
+            auto evicting_address = (ever_seen_data ? way->address : way->v_address) & ~champsim::bitmask(match_offset_bits ? 0 : OFFSET_BITS);
+            auto evicting_paddress = way->address & ~champsim::bitmask(match_offset_bits ? 0 : OFFSET_BITS);
+
+            if (way->from_prefetch && way->sour_level == 1 && way->dest_level == 2 && this->NAME.find("L2C") != std::string::npos) {
+                ++sim_stats.pf_useless_at_l2_from_l1;
+                if (!warmup)
+                    num_useless_gaze[way->pf_metadata & 3]++;
+            }
+
+            if (way->prefetch) {
+
+                impl_prefetcher_cache_eviction(evicting_address, evicting_paddress);
+                // used for pollution, evict a prefetched block
+                metadata_thru |= (1 << 23);
+                if __pf_stride(way->pf_metadata){
+                    ++sim_stats.pf_stride_useless;
+                }
+                if __pf_first_offset(way->pf_metadata){
+                    ++sim_stats.pf_first_offset_useless;
+                }
+                // if __pf_first_offset_fallback(way->pf_metadata){
+                //     ++sim_stats.pf_first_offset_fallback_useless;
+                // }
+                if __pf_second_offset(way->pf_metadata){
+                    ++sim_stats.pf_second_offset_useless;
+                }
+                // if __pf_second_offset_fallback(way->pf_metadata){
+                //     ++sim_stats.pf_second_offset_fallback_useless;
+                // }
+                if __pf_third_offset(way->pf_metadata){
+                    ++sim_stats.pf_third_offset_useless;
+                }
+                if __pf_stream(way->pf_metadata){
+                    ++sim_stats.pf_stream_useless;
+                }
+                // if __pf_pc_offset(way->pf_metadata){
+                //     ++sim_stats.pf_pc_useless;
+                // }
+
+                ++sim_stats.pf_useless;
+                ++sim_stats.pref_useless[__decode_ipcp_type(way->pf_metadata)];
+                if (!warmup)
+                    num_useless_gaze[way->pf_metadata & 3]++;
+            }
+
+            if (fill_mshr.late_prefetch)
+                // used for late prefetch
+                metadata_thru |= (1 << 22);
+
+            if (fill_mshr.type == PREFETCH) {
+                if __pf_stride(fill_mshr.pf_metadata){
+                    ++sim_stats.pf_stride_fill;
+                }
+                if __pf_first_offset(fill_mshr.pf_metadata){
+                    ++sim_stats.pf_first_offset_fill;
+                }
+                // if __pf_first_offset_fallback(fill_mshr.pf_metadata){
+                //     ++sim_stats.pf_first_offset_fallback_fill;
+                // }
+                if __pf_second_offset(fill_mshr.pf_metadata){
+                    ++sim_stats.pf_second_offset_fill;
+                }
+                // if __pf_second_offset_fallback(fill_mshr.pf_metadata){
+                //     ++sim_stats.pf_second_offset_fallback_fill;
+                // }
+                if __pf_third_offset(fill_mshr.pf_metadata){
+                    ++sim_stats.pf_third_offset_fill;
+                }
+
+                if __pf_stream(fill_mshr.pf_metadata){
+                    ++sim_stats.pf_stream_fill;
+                }
+                // if __pf_pc_offset(fill_mshr.pf_metadata){
+                //     ++sim_stats.pf_pc_fill;
+                // }
+                ++sim_stats.pf_fill;
+                ++sim_stats.pref_filled[__decode_ipcp_type(fill_mshr.pf_metadata)];
+                if ((this->NAME.find("L2C") != std::string::npos && __pf_dest(fill_mshr.pf_metadata) == 2) || (this->NAME.find("L1D") != std::string::npos && __pf_dest(fill_mshr.pf_metadata) == 1) || (this->NAME.find("LLC") != std::string::npos && __pf_dest(fill_mshr.pf_metadata) == 3)) {
+                    ++sim_stats.pf_fill_this_level;
+                    if (!warmup)
+                        num_fill_gaze[fill_mshr.pf_metadata & 3]++;
+                }
+            }
+
+            way->valid = true;
+            way->prefetch = fill_mshr.prefetch_from_this;
+            way->dirty = (fill_mshr.type == WRITE);
+            way->address = fill_mshr.address;
+            way->v_address = fill_mshr.v_address;
+            way->data = fill_mshr.data;
+
+            way->from_prefetch = (fill_mshr.type == PREFETCH);
+            way->sour_level = __pf_sour(fill_mshr.pf_metadata);
+            way->dest_level = __pf_dest(fill_mshr.pf_metadata);
+
+            metadata_thru =
+                impl_prefetcher_cache_fill(pkt_address, get_set_index(fill_mshr.address), way_idx, fill_mshr.type == PREFETCH, evicting_paddress, metadata_thru);
+            impl_update_replacement_state(fill_mshr.cpu, get_set_index(fill_mshr.address), way_idx, fill_mshr.address, fill_mshr.ip, evicting_address, fill_mshr.type,
+                                          false);
+
+            // used for pollution, reset used bit
+            metadata_thru &= (~(1 << 23));
+            metadata_thru &= (~(1 << 22));
+
+            way->pf_metadata = metadata_thru;
+        }
+    } else {
+        // Bypass
+        assert(fill_mshr.type != WRITE);
+
+        metadata_thru = impl_prefetcher_cache_fill(pkt_address, get_set_index(fill_mshr.address), way_idx, fill_mshr.type == PREFETCH, 0, metadata_thru);
+        impl_update_replacement_state(fill_mshr.cpu, get_set_index(fill_mshr.address), way_idx, fill_mshr.address, fill_mshr.ip, 0, fill_mshr.type, false);
+    }
+
+    if (success) {
+        // COLLECT STATS
+        if (!warmup)
+            sim_stats.total_miss_latency += current_cycle - (fill_mshr.cycle_enqueued + 1);
+
+        auto copy{fill_mshr};
+        copy.pf_metadata = metadata_thru;
+        for (auto ret : copy.to_return)
+            ret->return_data(copy);
+    }
+
+    return success;
+}
+
+bool CACHE::try_hit(const PACKET& handle_pkt) {
+    cpu = handle_pkt.cpu;
+
+    // access cache
+    auto [set_begin, set_end] = get_set_span(handle_pkt.address);
+    auto way = std::find_if(set_begin, set_end, eq_addr<BLOCK>(handle_pkt.address, OFFSET_BITS));
+    const auto hit = (way != set_end);
+
+    if constexpr (champsim::debug_print) {
+        std::cout << "[" << NAME << "] " << __func__;
+        std::cout << " instr_id: " << handle_pkt.instr_id << " address: " << std::hex << (handle_pkt.address >> OFFSET_BITS);
+        std::cout << " full_addr: " << handle_pkt.address;
+        std::cout << " full_v_addr: " << handle_pkt.v_address << std::dec;
+        std::cout << " set: " << get_set_index(handle_pkt.address);
+        std::cout << " way: " << std::distance(set_begin, way) << " (" << (hit ? "HIT" : "MISS") << ")";
+        std::cout << " type: " << +handle_pkt.type;
+        std::cout << " cycle: " << current_cycle << std::endl;
+    }
+
+#ifdef DEBUG_L2C
+    if ( this->NAME.find("L2C") != std::string::npos ) {
+        if (!warmup){
+            std::cout << "[" << NAME << "] ";
+            std::cout << " full_addr: " << handle_pkt.address;
+            std::cout << " full_v_addr: " << handle_pkt.v_address << std::dec;
+            std::cout << " HIT: " << (hit ? "HIT" : "MISS");
+            std::cout << " type: " << +handle_pkt.type;
+            std::cout << " cycle: " << current_cycle << std::endl;
+        }
+    }
+#endif
+#ifdef DEBUG_L1D
+    if ( this->NAME.find("L1D") != std::string::npos ) {
+        if (!warmup){
+            std::cout << "[" << NAME << "] ";
+            std::cout << " full_addr: " << handle_pkt.address;
+            std::cout << " full_v_addr: " << handle_pkt.v_address << std::dec;
+            std::cout << " HIT: " << (hit ? "HIT" : "MISS");
+            std::cout << " type: " << +handle_pkt.type;
+            std::cout << " cycle: " << current_cycle << std::endl;
+        }
+    }
+#endif
+
+    // update prefetcher on load instructions and prefetches from upper levels
+    auto metadata_thru = handle_pkt.pf_metadata;
+    if (should_activate_prefetcher(handle_pkt)) {
+        uint64_t pf_base_addr = (virtual_prefetch ? handle_pkt.v_address : handle_pkt.address) & ~champsim::bitmask(match_offset_bits ? 0 : OFFSET_BITS);
+        metadata_thru = impl_prefetcher_cache_operate(pf_base_addr, handle_pkt.ip, hit, handle_pkt.type, metadata_thru);
+    }
+
+    if (hit) {
+
+        ++sim_stats.hits[handle_pkt.type][handle_pkt.cpu];
+
+        // update replacement policy
+        const auto way_idx = static_cast<std::size_t>(std::distance(set_begin, way)); // cast protected by earlier assertion
+
+        if (handle_pkt.type != PREFETCH)
+            impl_update_replacement_state(handle_pkt.cpu, get_set_index(handle_pkt.address), way_idx, way->address, handle_pkt.ip, 0, handle_pkt.type, true);
+
+        if (way->from_prefetch && handle_pkt.type != PREFETCH && way->dest_level == 2 && way->sour_level == 1 && this->NAME.find("L2C") != std::string::npos) { // only consider L1D prefetcher
+            ++sim_stats.pf_useful_at_l2_from_l1;
+            way->from_prefetch = false;
+            if (!warmup)
+                num_useful_gaze[way->pf_metadata & 3]++;
+        }
+        // update prefetch stats and reset prefetch bit
+        // if (way->prefetch && !handle_pkt.prefetch_from_this) {
+        if (way->prefetch && handle_pkt.type != PREFETCH) {
+            if __pf_stride(way->pf_metadata){
+                ++sim_stats.pf_stride_useful;
+                way->prefetch = false;
+            }
+            if __pf_first_offset(way->pf_metadata){
+                ++sim_stats.pf_first_offset_useful;
+                way->prefetch = false;
+            }
+            // if __pf_first_offset_fallback(way->pf_metadata){
+            //     ++sim_stats.pf_first_offset_fallback_useful;
+            //     way->prefetch = false;
+            // }
+            if __pf_second_offset(way->pf_metadata){
+                ++sim_stats.pf_second_offset_useful;
+                way->prefetch = false;
+            }
+            // if __pf_second_offset_fallback(way->pf_metadata){
+            //     ++sim_stats.pf_second_offset_fallback_useful;
+            //     way->prefetch = false;
+            // }
+            if __pf_third_offset(way->pf_metadata){
+                ++sim_stats.pf_third_offset_useful;
+                way->prefetch = false;
+            }
+
+            if __pf_stream(way->pf_metadata){
+                ++sim_stats.pf_stream_useful;
+                way->prefetch = false;
+            }
+            // if __pf_pc_offset(way->pf_metadata){
+            //     ++sim_stats.pf_pc_useful;
+            //     way->prefetch = false;
+            // }
+            ++sim_stats.pf_useful;
+            ++sim_stats.pref_useful[__decode_ipcp_type(way->pf_metadata)];
+            way->prefetch = false;
+            if (!warmup)
+                num_useful_gaze[way->pf_metadata & 3]++;
+        }
+        if (handle_pkt.type == PREFETCH && way->from_prefetch) {
+            if (way->dest_level == 2 && __pf_dest(handle_pkt.pf_metadata) == 1) {
+                ++sim_stats.l2_pf_to_l1;
+                way->dest_level = __pf_dest(handle_pkt.pf_metadata);
+                way->sour_level = __pf_sour(handle_pkt.pf_metadata);
+            }
+        }
+
+        auto copy{handle_pkt};
+        copy.data = way->data;
+        copy.pf_metadata = metadata_thru;
+        for (auto ret : copy.to_return)
+            ret->return_data(copy);
+
+        way->dirty = (handle_pkt.type == WRITE);
+    }
+
+    return hit;
+}
+
+bool CACHE::handle_miss(const PACKET& handle_pkt) {
+    if constexpr (champsim::debug_print) {
+        std::cout << "[" << NAME << "] " << __func__;
+        std::cout << " instr_id: " << handle_pkt.instr_id << " address: " << std::hex << (handle_pkt.address >> OFFSET_BITS);
+        std::cout << " full_addr: " << handle_pkt.address;
+        std::cout << " full_v_addr: " << handle_pkt.v_address << std::dec;
+        std::cout << " type: " << +handle_pkt.type;
+        std::cout << " local_prefetch: " << std::boolalpha << handle_pkt.prefetch_from_this << std::noboolalpha;
+        std::cout << " cycle: " << current_cycle << std::endl;
+    }
+
+    cpu = handle_pkt.cpu;
+
+
+    auto mshr_entry = std::find_if(MSHR.begin(), MSHR.end(), eq_addr<PACKET>(handle_pkt.address, OFFSET_BITS));
+    bool mshr_full = (MSHR.size() == MSHR_SIZE);
+
+    if (mshr_entry != MSHR.end()) // miss already inflight
+    {
+        auto instr_copy = std::move(mshr_entry->instr_depend_on_me);
+        auto ret_copy = std::move(mshr_entry->to_return);
+
+        std::set_union(std::begin(instr_copy), std::end(instr_copy), std::begin(handle_pkt.instr_depend_on_me), std::end(handle_pkt.instr_depend_on_me),
+                       std::back_inserter(mshr_entry->instr_depend_on_me), ooo_model_instr::program_order);
+        std::set_union(std::begin(ret_copy), std::end(ret_copy), std::begin(handle_pkt.to_return), std::end(handle_pkt.to_return),
+                       std::back_inserter(mshr_entry->to_return));
+
+        if (mshr_entry->type == PREFETCH && handle_pkt.type != PREFETCH) {
+            // Mark the prefetch as useful
+            if (mshr_entry->prefetch_from_this) {
+                if __pf_stride(mshr_entry->pf_metadata){
+                    ++sim_stats.pf_stride_useful;
+                    ++sim_stats.pf_stride_late;
+                }
+                if __pf_first_offset(mshr_entry->pf_metadata){
+                    ++sim_stats.pf_first_offset_useful;
+                    ++sim_stats.pf_first_offset_late;
+                }
+                // if __pf_first_offset_fallback(mshr_entry->pf_metadata){
+                //     ++sim_stats.pf_first_offset_fallback_useful;
+                //     ++sim_stats.pf_first_offset_fallback_late;
+                // }
+                if __pf_second_offset(mshr_entry->pf_metadata){
+                    ++sim_stats.pf_second_offset_useful;
+                    ++sim_stats.pf_second_offset_late;
+                }
+                // if __pf_second_offset_fallback(mshr_entry->pf_metadata){
+                //     ++sim_stats.pf_second_offset_fallback_useful;
+                //     ++sim_stats.pf_second_offset_fallback_late;
+                // }
+                if __pf_third_offset(mshr_entry->pf_metadata){
+                    ++sim_stats.pf_third_offset_useful;
+                    ++sim_stats.pf_third_offset_late;
+                }
+
+                if __pf_stream(mshr_entry->pf_metadata){
+                    ++sim_stats.pf_stream_useful;
+                    ++sim_stats.pf_stream_late;
+                }
+                // if __pf_pc_offset(mshr_entry->pf_metadata){
+                //     ++sim_stats.pf_pc_useful;
+                //     ++sim_stats.pf_pc_late;
+                // }
+                ++sim_stats.pf_useful;
+                ++sim_stats.pf_late;
+                ++sim_stats.pref_useful[__decode_ipcp_type(mshr_entry->pf_metadata)];
+                ++sim_stats.pref_late[__decode_ipcp_type(mshr_entry->pf_metadata)];
+                if (!warmup)
+                    num_useful_gaze[mshr_entry->pf_metadata & 3]++;
+            }
+            if (__pf_dest(mshr_entry->pf_metadata) == 2 && __pf_sour(mshr_entry->pf_metadata) == 1 && this->NAME.find("L2C") != std::string::npos) {
+                ++sim_stats.pf_useful_at_l2_from_l1;
+                ++sim_stats.pf_late_at_l2_from_l1;
+                if (!warmup)
+                    num_useful_gaze[mshr_entry->pf_metadata & 3]++;
+            }
+
+            uint64_t prior_event_cycle = mshr_entry->event_cycle;
+            auto to_return = std::move(mshr_entry->to_return);
+            *mshr_entry = handle_pkt;
+
+            // in case request is already returned, we should keep event_cycle
+            mshr_entry->event_cycle = prior_event_cycle;
+            mshr_entry->cycle_enqueued = current_cycle;
+            mshr_entry->to_return = std::move(to_return);
+            mshr_entry->late_prefetch = true;
+        }
+    } else {
+        if (mshr_full) { // not enough MSHR resource
+            if (handle_pkt.type != PREFETCH || handle_pkt.fill_this_level) {
+                ++sim_stats.mshr_full;
+                return false;
+            }
+        }
+        auto fwd_pkt = handle_pkt;
+
+        if (fwd_pkt.type == WRITE)
+            fwd_pkt.type = RFO;
+
+        if (handle_pkt.fill_this_level)
+            fwd_pkt.to_return = {this};
+        else
+            fwd_pkt.to_return.clear();
+
+        fwd_pkt.fill_this_level = true; // We will always fill the lower level
+        fwd_pkt.prefetch_from_this = false;
+
+        bool success;
+        if (prefetch_as_load || handle_pkt.type != PREFETCH)
+            success = lower_level->add_rq(fwd_pkt);
+        else {
+            success = lower_level->add_pq(fwd_pkt);
+#ifdef BERTI
+            if (handle_pkt.fill_this_level)
+                notify_prefetch(fwd_pkt.address, fwd_pkt.ip, cpu, fwd_pkt.cycle_enqueued);
+                // std::cout << fwd_pkt.cycle_enqueued << " ";
+#endif
+        }
+
+        if (!success)
+            return false;
+
+        // Allocate an MSHR
+        if (!std::empty(fwd_pkt.to_return)) {
+            mshr_entry = MSHR.insert(std::end(MSHR), handle_pkt);
+            mshr_entry->pf_metadata = fwd_pkt.pf_metadata;
+            mshr_entry->cycle_enqueued = current_cycle;
+            mshr_entry->event_cycle = std::numeric_limits<uint64_t>::max();
+        }
+    }
+    ++sim_stats.misses[handle_pkt.type][handle_pkt.cpu];
+
+    return true;
+}
+
+bool CACHE::handle_write(const PACKET& handle_pkt) {
+    if constexpr (champsim::debug_print) {
+        std::cout << "[" << NAME << "] " << __func__;
+        std::cout << " instr_id: " << handle_pkt.instr_id;
+        std::cout << " full_addr: " << std::hex << handle_pkt.address;
+        std::cout << " full_v_addr: " << handle_pkt.v_address << std::dec;
+        std::cout << " type: " << +handle_pkt.type;
+        std::cout << " local_prefetch: " << std::boolalpha << handle_pkt.prefetch_from_this << std::noboolalpha;
+        std::cout << " cycle: " << current_cycle << std::endl;
+    }
+
+    inflight_writes.push_back(handle_pkt);
+    inflight_writes.back().event_cycle = current_cycle + (warmup ? 0 : FILL_LATENCY);
+    inflight_writes.back().cycle_enqueued = current_cycle;
+
+    return true;
+}
+
+template <typename R, typename F>
+long int operate_queue(R& queue, long int sz, F&& func) {
+    auto [begin, end] = champsim::get_span_p(std::cbegin(queue), std::cend(queue), sz, std::forward<F>(func));
+    auto retval = std::distance(begin, end);
+    queue.erase(begin, end);
+    return retval;
+}
+
+void CACHE::operate() {
+    auto tag_bw = MAX_TAG;
+    auto fill_bw = MAX_FILL;
+
+    auto do_fill = [cycle = current_cycle, this](const auto& x) {
+        return x.event_cycle <= cycle && this->handle_fill(x);
+    };
+
+    auto operate_readlike = [&, this](const auto& pkt) {
+        return queues.is_ready(pkt) && (this->try_hit(pkt) || this->handle_miss(pkt));
+    };
+
+    auto operate_writelike = [&, this](const auto& pkt) {
+        return queues.is_ready(pkt) && (this->try_hit(pkt) || this->handle_write(pkt));
+    };
+
+    for (auto q : {std::ref(MSHR), std::ref(inflight_writes)}) {
+        fill_bw -= operate_queue(q.get(), fill_bw, do_fill);
+    }
+
+    if (match_offset_bits) {
+        for (auto q : {std::ref(queues.WQ), std::ref(queues.PTWQ), std::ref(queues.RQ), std::ref(queues.PQ)})
+            tag_bw -= operate_queue(q.get(), tag_bw, operate_readlike);
+    } else {
+        tag_bw -= operate_queue(queues.WQ, tag_bw, operate_writelike);
+
+        for (auto q : {std::ref(queues.PTWQ), std::ref(queues.RQ), std::ref(queues.PQ)})
+            tag_bw -= operate_queue(q.get(), tag_bw, operate_readlike);
+    }
+
+    impl_prefetcher_cycle_operate();
+}
+
+uint64_t CACHE::get_set(uint64_t address) const { return get_set_index(address); }
+
+std::size_t CACHE::get_set_index(uint64_t address) const { return (address >> OFFSET_BITS) & champsim::bitmask(champsim::lg2(NUM_SET)); }
+
+template <typename It>
+std::pair<It, It> get_span(It anchor, typename std::iterator_traits<It>::difference_type set_idx, typename std::iterator_traits<It>::difference_type num_way) {
+    auto begin = std::next(anchor, set_idx * num_way);
+    return {std::move(begin), std::next(begin, num_way)};
+}
+
+auto CACHE::get_set_span(uint64_t address) -> std::pair<std::vector<BLOCK>::iterator, std::vector<BLOCK>::iterator> {
+    const auto set_idx = get_set_index(address);
+    assert(set_idx < NUM_SET);
+    return get_span(std::begin(block), static_cast<std::vector<BLOCK>::difference_type>(set_idx), NUM_WAY); // safe cast because of prior assert
+}
+
+auto CACHE::get_set_span(uint64_t address) const -> std::pair<std::vector<BLOCK>::const_iterator, std::vector<BLOCK>::const_iterator> {
+    const auto set_idx = get_set_index(address);
+    assert(set_idx < NUM_SET);
+    return get_span(std::cbegin(block), static_cast<std::vector<BLOCK>::difference_type>(set_idx), NUM_WAY); // safe cast because of prior assert
+}
+
+uint64_t CACHE::get_way(uint64_t address, uint64_t) const {
+    auto [begin, end] = get_set_span(address);
+    return std::distance(begin, std::find_if(begin, end, eq_addr<BLOCK>(address, OFFSET_BITS)));
+}
+
+uint64_t CACHE::invalidate_entry(uint64_t inval_addr) {
+    auto [begin, end] = get_set_span(inval_addr);
+    auto inv_way = std::find_if(begin, end, eq_addr<BLOCK>(inval_addr, OFFSET_BITS));
+
+    if (inv_way != end)
+        inv_way->valid = 0;
+
+    return std::distance(begin, inv_way);
+}
+
+bool CACHE::add_rq(const PACKET& packet) {
+    if constexpr (champsim::debug_print) {
+        std::cout << "[" << NAME << "_RQ] " << __func__ << " instr_id: " << packet.instr_id << " address: " << std::hex << (packet.address >> OFFSET_BITS);
+        std::cout << " full_addr: " << packet.address << " v_address: " << packet.v_address << std::dec << " type: " << +packet.type
+                  << " occupancy: " << std::size(queues.RQ) << " current_cycle: " << current_cycle << std::endl;
+    }
+
+    return queues.add_rq(packet);
+}
+
+bool CACHE::add_wq(const PACKET& packet) {
+    if constexpr (champsim::debug_print) {
+        std::cout << "[" << NAME << "_WQ] " << __func__ << " instr_id: " << packet.instr_id << " address: " << std::hex << (packet.address >> OFFSET_BITS);
+        std::cout << " full_addr: " << packet.address << " v_address: " << packet.v_address << std::dec << " type: " << +packet.type
+                  << " occupancy: " << std::size(queues.WQ) << " current_cycle: " << current_cycle << std::endl;
+    }
+    return queues.add_wq(packet);
+}
+
+bool CACHE::add_ptwq(const PACKET& packet) {
+    if constexpr (champsim::debug_print) {
+        std::cout << "[" << NAME << "_PTWQ] " << __func__ << " instr_id: " << packet.instr_id << " address: " << std::hex << (packet.address >> OFFSET_BITS);
+        std::cout << " full_addr: " << packet.address << " v_address: " << packet.v_address << std::dec << " type: " << +packet.type
+                  << " occupancy: " << std::size(queues.PTWQ) << " current_cycle: " << current_cycle;
+    }
+    return queues.add_ptwq(packet);
+}
+
+int CACHE::prefetch_line(uint64_t pf_addr, bool fill_this_level, uint32_t prefetch_metadata) {
+    if __pf_stride(prefetch_metadata){
+        ++sim_stats.pf_stride_requested;
+    }
+    if __pf_first_offset(prefetch_metadata){
+        ++sim_stats.pf_first_offset_requested;
+    }
+    // if __pf_first_offset_fallback(prefetch_metadata){
+    //     ++sim_stats.pf_first_offset_fallback_requested;
+    // }
+    if __pf_second_offset(prefetch_metadata){
+        ++sim_stats.pf_second_offset_requested;
+    }
+    // if __pf_second_offset_fallback(prefetch_metadata){
+    //     ++sim_stats.pf_second_offset_fallback_requested;
+    // }
+    if __pf_third_offset(prefetch_metadata){
+        ++sim_stats.pf_third_offset_requested;
+    }
+
+    if __pf_stream(prefetch_metadata){
+        ++sim_stats.pf_stream_requested;
+    }
+    // if __pf_pc_offset(prefetch_metadata){
+    //     ++sim_stats.pf_pc_requested;
+    // }
+    ++sim_stats.pf_requested;
+
+    PACKET pf_packet;
+    pf_packet.type = PREFETCH;
+    pf_packet.prefetch_from_this = true;
+    pf_packet.fill_this_level = fill_this_level;
+    pf_packet.pf_metadata = prefetch_metadata;
+    pf_packet.cpu = cpu;
+    pf_packet.address = pf_addr;
+    pf_packet.v_address = virtual_prefetch ? pf_addr : 0;
+    pf_packet.cycle_enqueued = current_cycle;
+
+    auto success = this->add_pq(pf_packet);
+    if (success){
+        if __pf_stride(prefetch_metadata){
+            ++sim_stats.pf_stride_issued;
+        }
+        if __pf_first_offset(prefetch_metadata){
+            ++sim_stats.pf_first_offset_issued;
+        }
+        // if __pf_first_offset_fallback(prefetch_metadata){
+        //     ++sim_stats.pf_first_offset_fallback_issued;
+        // }
+        if __pf_second_offset(prefetch_metadata){
+            ++sim_stats.pf_second_offset_issued;
+        }
+        // if __pf_second_offset_fallback(prefetch_metadata){
+        //     ++sim_stats.pf_second_offset_fallback_issued;
+        // }
+        if __pf_third_offset(prefetch_metadata){
+            ++sim_stats.pf_third_offset_issued;
+        }
+
+        if __pf_stream(prefetch_metadata){
+            ++sim_stats.pf_stream_issued;
+        }
+        // if __pf_pc_offset(prefetch_metadata){
+        //     ++sim_stats.pf_pc_issued;
+        // }
+        ++sim_stats.pf_issued;
+    }
+    return success;
+}
+
+int CACHE::prefetch_line(uint64_t, uint64_t, uint64_t pf_addr, bool fill_this_level, uint32_t prefetch_metadata) {
+    return prefetch_line(pf_addr, fill_this_level, prefetch_metadata);
+}
+
+bool CACHE::add_pq(const PACKET& packet) {
+    if constexpr (champsim::debug_print) {
+        std::cout << "[" << NAME << "_PQ] " << __func__ << " instr_id: " << packet.instr_id << " address: " << std::hex << (packet.address >> OFFSET_BITS);
+        std::cout << " full_addr: " << packet.address << " v_address: " << packet.v_address << std::dec << " type: " << +packet.type
+                  << " from this: " << std::boolalpha << packet.prefetch_from_this << std::noboolalpha << " occupancy: " << std::size(queues.PQ)
+                  << " current_cycle: " << current_cycle;
+    }
+    return queues.add_pq(packet);
+}
+
+void CACHE::return_data(const PACKET& packet) {
+    // check MSHR information
+    auto mshr_entry = std::find_if(MSHR.begin(), MSHR.end(), eq_addr<PACKET>(packet.address, OFFSET_BITS));
+    auto first_unreturned = std::find_if(MSHR.begin(), MSHR.end(), [](auto x) { return x.event_cycle == std::numeric_limits<uint64_t>::max(); });
+
+    // sanity check
+    if (mshr_entry == MSHR.end()) {
+        std::cerr << "[" << NAME << "_MSHR] " << __func__ << " instr_id: " << packet.instr_id << " cannot find a matching entry!";
+        std::cerr << " address: " << std::hex << packet.address;
+        std::cerr << " v_address: " << packet.v_address;
+        std::cerr << " address: " << (packet.address >> OFFSET_BITS) << std::dec;
+        std::cerr << " event: " << packet.event_cycle << " current: " << current_cycle << std::endl;
+        assert(0);
+    }
+
+    // MSHR holds the most updated information about this request
+    mshr_entry->data = packet.data;
+    mshr_entry->pf_metadata = packet.pf_metadata;
+    mshr_entry->event_cycle = current_cycle + (warmup ? 0 : FILL_LATENCY);
+
+    if constexpr (champsim::debug_print) {
+        std::cout << "[" << NAME << "_MSHR] " << __func__ << " instr_id: " << mshr_entry->instr_id;
+        std::cout << " address: " << std::hex << mshr_entry->address;
+        std::cout << " data: " << mshr_entry->data << std::dec;
+        std::cout << " event: " << mshr_entry->event_cycle << " current: " << current_cycle << std::endl;
+    }
+
+    // Order this entry after previously-returned entries, but before non-returned
+    // entries
+    std::iter_swap(mshr_entry, first_unreturned);
+}
+
+std::size_t CACHE::get_occupancy(uint8_t queue_type, uint64_t) {
+    if (queue_type == 0)
+        return std::size(MSHR);
+    else if (queue_type == 1)
+        return std::size(queues.RQ);
+    else if (queue_type == 2)
+        return std::size(queues.WQ);
+    else if (queue_type == 3)
+        return std::size(queues.PQ);
+    return 0;
+}
+
+std::size_t CACHE::get_size(uint8_t queue_type, uint64_t) {
+    if (queue_type == 0)
+        return MSHR_SIZE;
+    else if (queue_type == 1)
+        return queues.RQ_SIZE;
+    else if (queue_type == 2)
+        return queues.WQ_SIZE;
+    else if (queue_type == 3)
+        return queues.PQ_SIZE;
+    else if (queue_type == 4)
+        return queues.PTWQ_SIZE;
+
+    return 0;
+}
+
+void CACHE::initialize() {
+    impl_prefetcher_initialize();
+    impl_initialize_replacement();
+}
+
+void CACHE::begin_phase() {
+    stats_type new_roi_stats, new_sim_stats;
+
+    new_roi_stats.name = NAME;
+    new_sim_stats.name = NAME;
+
+    roi_stats = new_roi_stats;
+    sim_stats = new_sim_stats;
+}
+
+void CACHE::end_phase(unsigned finished_cpu) {
+    for (auto type : {LOAD, RFO, PREFETCH, WRITE, TRANSLATION}) {
+        roi_stats.hits.at(type).at(finished_cpu) = sim_stats.hits.at(type).at(finished_cpu);
+        roi_stats.misses.at(type).at(finished_cpu) = sim_stats.misses.at(type).at(finished_cpu);
+    }
+
+    roi_stats.pf_requested = sim_stats.pf_requested;
+    roi_stats.pf_issued = sim_stats.pf_issued;
+    roi_stats.pf_useful = sim_stats.pf_useful;
+    roi_stats.pf_useless = sim_stats.pf_useless;
+    roi_stats.pf_fill = sim_stats.pf_fill;
+    roi_stats.pf_stride_requested = sim_stats.pf_stride_requested;
+    roi_stats.pf_stride_issued = sim_stats.pf_stride_issued;
+    roi_stats.pf_stride_useful = sim_stats.pf_stride_useful;
+    roi_stats.pf_stride_useless = sim_stats.pf_stride_useless;
+    roi_stats.pf_stride_fill = sim_stats.pf_stride_fill;
+    roi_stats.pf_stride_late = sim_stats.pf_stride_late;
+    roi_stats.pf_first_offset_requested = sim_stats.pf_first_offset_requested;
+    roi_stats.pf_first_offset_issued = sim_stats.pf_first_offset_issued;
+    roi_stats.pf_first_offset_useful = sim_stats.pf_first_offset_useful;
+    roi_stats.pf_first_offset_useless = sim_stats.pf_first_offset_useless;
+    roi_stats.pf_first_offset_fill = sim_stats.pf_first_offset_fill;
+    roi_stats.pf_first_offset_late = sim_stats.pf_first_offset_late;
+    roi_stats.pf_second_offset_requested = sim_stats.pf_second_offset_requested;
+    roi_stats.pf_second_offset_issued = sim_stats.pf_second_offset_issued;
+    roi_stats.pf_second_offset_useful = sim_stats.pf_second_offset_useful;
+    roi_stats.pf_second_offset_useless = sim_stats.pf_second_offset_useless;
+    roi_stats.pf_second_offset_fill = sim_stats.pf_second_offset_fill;
+    roi_stats.pf_second_offset_late = sim_stats.pf_second_offset_late;
+    roi_stats.pf_third_offset_requested = sim_stats.pf_third_offset_requested;
+    roi_stats.pf_third_offset_issued = sim_stats.pf_third_offset_issued;
+    roi_stats.pf_third_offset_useful = sim_stats.pf_third_offset_useful;
+    roi_stats.pf_third_offset_useless = sim_stats.pf_third_offset_useless;
+    roi_stats.pf_third_offset_fill = sim_stats.pf_third_offset_fill;
+    roi_stats.pf_third_offset_late = sim_stats.pf_third_offset_late;
+    roi_stats.pf_stream_requested = sim_stats.pf_stream_requested;
+    roi_stats.pf_stream_issued = sim_stats.pf_stream_issued;
+    roi_stats.pf_stream_useful = sim_stats.pf_stream_useful;
+    roi_stats.pf_stream_useless = sim_stats.pf_stream_useless;
+    roi_stats.pf_stream_fill = sim_stats.pf_stream_fill;
+    roi_stats.pf_stream_late = sim_stats.pf_stream_late;
+
+    roi_stats.pf_late = sim_stats.pf_late;
+    roi_stats.total_trigger = sim_stats.total_trigger;
+    roi_stats.pht_trigger = sim_stats.pht_trigger;
+    roi_stats.pc_trigger = sim_stats.pc_trigger;
+    roi_stats.stride_trigger = sim_stats.stride_trigger;
+    roi_stats.ft_drop = sim_stats.ft_drop;
+    roi_stats.pf_fill_this_level = sim_stats.pf_fill_this_level;
+    roi_stats.pf_useful_at_l2_from_l1 = sim_stats.pf_useful_at_l2_from_l1;
+    roi_stats.pf_late_at_l2_from_l1 = sim_stats.pf_late_at_l2_from_l1;
+    roi_stats.pf_useless_at_l2_from_l1 = sim_stats.pf_useless_at_l2_from_l1;
+    roi_stats.pf_useful_at_llc_from_l1 = sim_stats.pf_useful_at_llc_from_l1;
+    roi_stats.pf_useless_at_llc_from_l1 = sim_stats.pf_useless_at_llc_from_l1;
+    roi_stats.l2_pf_to_l1 = sim_stats.l2_pf_to_l1;
+    roi_stats.mshr_full = sim_stats.mshr_full;
+    for (int i = 0; i < 6; i++) {
+        roi_stats.pref_filled[i] = sim_stats.pref_filled[i];
+        roi_stats.pref_late[i] = sim_stats.pref_late[i];
+        roi_stats.pref_useful[i] = sim_stats.pref_useful[i];
+        roi_stats.pref_useless[i] = sim_stats.pref_useless[i];
+    }
+
+    roi_stats.total_miss_latency = sim_stats.total_miss_latency;
+}
+
+bool CACHE::should_activate_prefetcher(const PACKET& pkt) const { return ((1 << pkt.type) & pref_activate_mask) && !pkt.prefetch_from_this; }
+
+void CACHE::print_deadlock() {
+    if (!std::empty(MSHR)) {
+        std::cout << NAME << " MSHR Entry" << std::endl;
+        std::size_t j = 0;
+        for (PACKET entry : MSHR) {
+            std::cout << "[" << NAME << " MSHR] entry: " << j++ << " instr_id: " << entry.instr_id;
+            std::cout << " address: " << std::hex << entry.address << " v_addr: " << entry.v_address << std::dec << " type: " << +entry.type;
+            std::cout << " event_cycle: " << entry.event_cycle << std::endl;
+        }
+    } else {
+        std::cout << NAME << " MSHR empty" << std::endl;
+    }
+
+    if (!std::empty(queues.RQ)) {
+        for (const auto& entry : queues.RQ) {
+            std::cout << "[" << NAME << " RQ] "
+                      << " instr_id: " << entry.instr_id;
+            std::cout << " address: " << std::hex << entry.address << " v_addr: " << entry.v_address << std::dec << " type: " << +entry.type;
+            std::cout << " event_cycle: " << entry.event_cycle << std::endl;
+        }
+    } else {
+        std::cout << NAME << " RQ empty" << std::endl;
+    }
+
+    if (!std::empty(queues.WQ)) {
+        for (const auto& entry : queues.WQ) {
+            std::cout << "[" << NAME << " WQ] "
+                      << " instr_id: " << entry.instr_id;
+            std::cout << " address: " << std::hex << entry.address << " v_addr: " << entry.v_address << std::dec << " type: " << +entry.type;
+            std::cout << " event_cycle: " << entry.event_cycle << std::endl;
+        }
+    } else {
+        std::cout << NAME << " WQ empty" << std::endl;
+    }
+
+    if (!std::empty(queues.PQ)) {
+        for (const auto& entry : queues.PQ) {
+            std::cout << "[" << NAME << " PQ] "
+                      << " instr_id: " << entry.instr_id;
+            std::cout << " address: " << std::hex << entry.address << " v_addr: " << entry.v_address << std::dec << " type: " << +entry.type;
+            std::cout << " event_cycle: " << entry.event_cycle << std::endl;
+        }
+    } else {
+        std::cout << NAME << " PQ empty" << std::endl;
+    }
+}
